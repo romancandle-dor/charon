@@ -11,7 +11,10 @@ export function safeJson(value, fallback = null) {
 }
 
 export function json(value) {
-  return JSON.stringify(value ?? null);
+  // BigInt is not natively serializable by JSON.stringify — coerce to string.
+  return JSON.stringify(value ?? null, (_key, val) =>
+    typeof val === 'bigint' ? val.toString() : val,
+  );
 }
 
 export function sleep(ms) {

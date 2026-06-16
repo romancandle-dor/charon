@@ -87,7 +87,7 @@ export async function monitorPriceAlerts() {
           mint: alert.mint,
           fee: signal.feeClaim ? {
             mint: alert.mint,
-            distributed: BigInt(Math.floor(signal.feeClaim.distributedSol * 1e9)),
+            distributed: Math.floor(signal.feeClaim.distributedSol * 1e9),
             shareholders: (signal.feeClaim.shareholders || []).map(h => ({ pubkey: h.address, bps: h.bps })),
           } : null,
           signature: signal.feeClaim?.signature || null,
