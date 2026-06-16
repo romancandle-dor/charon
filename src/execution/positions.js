@@ -241,6 +241,126 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
   };
 }
 
+// ---- replace-weakest-when-full ----------------------------------------
+// When slots are full and a strong new candidate arrives, evict the weakest
+// open position (lowest live PnL) to make room — instead of dropping the signal.
+// Gated by settings so it stays off unless explicitly enabled.
+//   replace_weakest_when_full  (bool)  master toggle
+//   replace_only_sniper        (bool)  only sniper entries may evict (default true)
+//   replace_max_victim_pnl     (num)   only evict victims with live PnL <= this % (default 0 -> only flat/red)
+//   replace_protect_age_ms     (num)   don't evict positions younger than this (default 600000 = 10m)
+export async function evictWeakestForEntry(incomingStrat = null) {
+  if (!boolSetting('replace_weakest_when_full', false)) return null;
+  if (boolSetting('replace_only_sniper', true) && incomingStrat?.id && incomingStrat.id !== 'sniper') {
+    return null;
+  }
+  const maxVictimPnl = numSetting('replace_max_victim_pnl', 0);
+  const protectAgeMs = numSetting('replace_protect_age_ms', 600000);
+  const nowMs = now();
+
+  const open = openPositions();
+  if (!open.length) return null;
+
+  // Score each open position by live PnL; protect fresh ones and green runners.
+  const scored = [];
+  for (const pos of open) {
+    const ageMs = nowMs - Number(pos.opened_at_ms || nowMs);
+    if (ageMs < protectAgeMs) continue; // too young to judge
+    let pnl;
+    try {
+      const r = await refreshPosition(pos, { autoExit: false });
+      pnl = Number.isFinite(Number(r?.pnl_percent)) ? Number(r.pnl_percent) : null;
+    } catch {
+      pnl = null;
+    }
+    if (pnl == null) {
+      // fall back to last-known mcap-based estimate
+      pnl = (Number(pos.entry_mcap) > 0 && Number(pos.high_water_mcap) > 0)
+        ? (Number(pos.high_water_mcap) / Number(pos.entry_mcap) - 1) * 100
+        : 0;
+    }
+    if (pnl > maxVictimPnl) continue; // protect anything above threshold (green/running)
+    scored.push({ pos, pnl });
+  }
+  if (!scored.length) return null;
+
+  scored.sort((a, b) => a.pnl - b.pnl); // weakest first
+  const victim = scored[0];
+  const closed = await forceClosePosition(victim.pos, 'replaced_for_stronger');
+  if (closed) {
+    console.log(`[replace] evicted #${victim.pos.id} ${victim.pos.symbol || victim.pos.mint?.slice(0, 8)} @ ${victim.pnl.toFixed(1)}% for ${incomingStrat?.id || 'new'} entry`);
+    return { ...closed, victimPnl: victim.pnl };
+  }
+  return null;
+}
+
+// Force-close a position at current market, recording exit price + pnl + trade row.
+// Handles live sells; dry-run just marks closed. Returns the closed result or null.
+export async function forceClosePosition(position, reason = 'manual_close') {
+  if (sellInProgress.has(position.id)) return null;
+  let price, mcap;
+  try {
+    const asset = await fetchJupiterAsset(position.mint);
+    price = firstPositiveNumber(asset?.usdPrice, position.high_water_price, position.entry_price);
+    mcap = firstPositiveNumber(asset?.mcap, asset?.fdv, position.high_water_mcap, position.entry_mcap);
+  } catch {
+    price = position.high_water_price ?? position.entry_price;
+    mcap = position.high_water_mcap ?? position.entry_mcap;
+  }
+  let pnlPercent = Number(position.entry_mcap) > 0 ? (Number(mcap) / Number(position.entry_mcap) - 1) * 100 : 0;
+  let pnlSol = Number(position.size_sol) * pnlPercent / 100;
+  let exitSignature = null;
+
+  if (position.execution_mode === 'live') {
+    sellInProgress.add(position.id);
+    try {
+      const sell = await executeLiveSell(position, reason);
+      exitSignature = sell?.signature || null;
+      const receivedLamports = Number(sell?.outputAmount || 0);
+      const receivedSol = receivedLamports > 0 ? receivedLamports / 1_000_000_000 : null;
+      if (receivedSol != null) {
+        pnlSol = receivedSol - Number(position.size_sol);
+        pnlPercent = (receivedSol / Number(position.size_sol) - 1) * 100;
+      }
+    } catch (err) {
+      console.log(`[replace] live sell failed for #${position.id}: ${err.message}`);
+      sellInProgress.delete(position.id);
+      return null; // don't mark closed if the live sell failed
+    } finally {
+      sellInProgress.delete(position.id);
+    }
+  }
+
+  db.prepare(`
+    UPDATE dry_run_positions
+    SET status = 'closed', closed_at_ms = ?, exit_price = ?, exit_mcap = ?, exit_reason = ?,
+        pnl_percent = ?, pnl_sol = ?, exit_signature = ?
+    WHERE id = ? AND status = 'open'
+  `).run(now(), price, mcap, reason, pnlPercent, pnlSol, exitSignature, position.id);
+  db.prepare(`
+    INSERT INTO dry_run_trades (position_id, mint, side, at_ms, price, mcap, size_sol, token_amount_est, reason, payload_json)
+    VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, ?, ?)
+  `).run(position.id, position.mint, now(), price, mcap, position.size_sol, position.token_amount_est, reason, json({ pnlPercent, pnlSol }));
+
+  const result = {
+    ...position,
+    status: 'closed',
+    closed_at_ms: now(),
+    price, mcap,
+    exit_mcap: mcap, exit_price: price,
+    pnl_percent: pnlPercent, pnlPercent,
+    pnl_sol: pnlSol, pnlSol,
+    exit_reason: reason, exitReason: reason,
+  };
+  // mirror monitorPositions side-effects so cooldowns/learning stay consistent
+  try { sendPositionExit(result); } catch {}
+  try { applyCooldownOnClose(result); } catch {}
+  try { recordPositionSignals(result); } catch {}
+  try { evolveThresholds(); } catch {}
+  try { autoLearning().catch(() => {}); } catch {}
+  return result;
+}
+
 export async function monitorPositions() {
   const positions = openPositions();
   let walletPnlData = {};

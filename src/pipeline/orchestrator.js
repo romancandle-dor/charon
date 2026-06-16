@@ -10,7 +10,7 @@ import { sendBatchReveal, sendTelegram, sendPositionOpen, sendTradeIntent } from
 import { candidateSummary } from '../telegram/format.js';
 import { createTradeIntent } from '../db/intents.js';
 import { isMintOnCooldown, isRouteOnCooldown } from '../db/cooldowns.js';
-import { refreshCandidateForExecution } from '../execution/positions.js';
+import { refreshCandidateForExecution, evictWeakestForEntry } from '../execution/positions.js';
 import { executeLiveBuy } from '../execution/router.js';
 import { graduated } from '../signals/graduated.js';
 import { setDegenHandler } from '../signals/trending.js';
@@ -25,9 +25,15 @@ setCandidateHandler(processCandidateFromSignals);
 
 async function processForStrategy(signals, strat, base) {
   if (!canOpenMorePositions()) {
-    const max = numSetting('max_open_positions', 3);
-    console.log(`[${strat.id}] max positions (${openPositionCount()}/${max}), skip ${signals.mint.slice(0, 8)}`);
-    return;
+    // If replace-weakest is enabled (and this strat is eligible), don't drop the
+    // signal here — let it flow through filters/decision and evict at the BUY gate.
+    const replaceEligible = boolSetting('replace_weakest_when_full', false)
+      && (!boolSetting('replace_only_sniper', true) || strat.id === 'sniper');
+    if (!replaceEligible) {
+      const max = numSetting('max_open_positions', 3);
+      console.log(`[${strat.id}] max positions (${openPositionCount()}/${max}), skip ${signals.mint.slice(0, 8)}`);
+      return;
+    }
   }
 
   const mintCooldown = isMintOnCooldown(signals.mint);
@@ -108,14 +114,19 @@ async function processForStrategy(signals, strat, base) {
 
   if (selectedRow && agentEnabled && batchDecision.verdict === 'BUY' && batchDecision.confidence >= minConfidence) {
     if (!canOpenMorePositions()) {
-      const max = numSetting('max_open_positions', 3);
-      console.log(`[${strat.id}] max positions (${openPositionCount()}/${max}), skip buy ${selectedRow.candidate.token.mint}`);
-      logDecisionEvent({
-        batchId, triggerCandidateId: candidateId, selectedRow, rows, decision: batchDecision,
-        action: 'entry_skipped_max_positions',
-        guardrails: { maxOpenPositions: max, openPositions: openPositionCount(), strategy: strat.id },
-      });
-      return;
+      // Try replace-weakest-when-full before giving up the slot.
+      const evicted = await evictWeakestForEntry(strat);
+      if (!evicted || !canOpenMorePositions()) {
+        const max = numSetting('max_open_positions', 3);
+        console.log(`[${strat.id}] max positions (${openPositionCount()}/${max}), skip buy ${selectedRow.candidate.token.mint}`);
+        logDecisionEvent({
+          batchId, triggerCandidateId: candidateId, selectedRow, rows, decision: batchDecision,
+          action: 'entry_skipped_max_positions',
+          guardrails: { maxOpenPositions: max, openPositions: openPositionCount(), strategy: strat.id, replaceAttempted: Boolean(boolSetting('replace_weakest_when_full', false)) },
+        });
+        return;
+      }
+      console.log(`[${strat.id}] replaced #${evicted.id} (${evicted.victimPnl?.toFixed?.(1)}%) to free slot for ${selectedRow.candidate.token.mint.slice(0, 8)}`);
     }
     await handleApprovedBuy(selectedRow, batchDecision, batchId, rows, candidateId, strat);
   } else {
@@ -139,9 +150,15 @@ export async function processCandidateFromSignals(signals) {
   const strats = allEnabledStrategies();
   if (strats.length === 0) return;
   if (!canOpenMorePositions()) {
-    const max = numSetting('max_open_positions', 3);
-    console.log(`[agent] max positions (${openPositionCount()}/${max}), skip ${signals.mint.slice(0, 8)}`);
-    return;
+    // Only short-circuit here if replace-weakest is OFF (or no enabled strat is
+    // eligible). Otherwise let strategies run so the BUY gate can evict.
+    const anyReplaceEligible = boolSetting('replace_weakest_when_full', false)
+      && (!boolSetting('replace_only_sniper', true) || strats.some(s => s.id === 'sniper'));
+    if (!anyReplaceEligible) {
+      const max = numSetting('max_open_positions', 3);
+      console.log(`[agent] max positions (${openPositionCount()}/${max}), skip ${signals.mint.slice(0, 8)}`);
+      return;
+    }
   }
 
   const bucket = Math.floor(now() / (10 * 60 * 1000));

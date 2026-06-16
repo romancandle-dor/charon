@@ -41,6 +41,25 @@ export function filterCandidate(candidate, strat) {
   const trendingSwaps = Number(candidate.trending?.swaps ?? 0);
   const rugRatio = Number(candidate.trending?.rug_ratio ?? 0);
   const bundlerRate = Number(candidate.trending?.bundler_rate ?? 0);
+  // Smart-money signals (from GMGN trending row) — strongest runner predictors.
+  const smartDegen = Number(candidate.trending?.smart_degen_count ?? candidate.metrics?.trendingSmartDegenCount ?? 0);
+  const sniperCnt = Number(candidate.trending?.sniper_count ?? 0);
+  const renownedCnt = Number(candidate.trending?.renowned_count ?? 0);
+
+  // Smart-money gate: OR across configured thresholds. Only enforced when at
+  // least one min_* is set > 0. Data (2,279 tokens, buy-low zone): runners carry
+  // smart_degen/sniper/renowned far above duds; this gate lifts precision ~31%->71%.
+  const minSmartDegen = Number(strat.min_smart_degen_count ?? 0);
+  const minSniper = Number(strat.min_sniper_count ?? 0);
+  const minRenowned = Number(strat.min_renowned_count ?? 0);
+  if (minSmartDegen > 0 || minSniper > 0 || minRenowned > 0) {
+    const passes = (minSmartDegen > 0 && smartDegen >= minSmartDegen)
+      || (minSniper > 0 && sniperCnt >= minSniper)
+      || (minRenowned > 0 && renownedCnt >= minRenowned);
+    if (!passes) {
+      failures.push(`smart money: sd=${smartDegen}/snp=${sniperCnt}/ren=${renownedCnt} (need sd>=${minSmartDegen} OR snp>=${minSniper} OR ren>=${minRenowned})`);
+    }
+  }
 
   // Fee claim check
   if (candidate.feeClaim) {
