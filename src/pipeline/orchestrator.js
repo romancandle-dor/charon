@@ -45,8 +45,21 @@ async function processForStrategy(signals, strat, base) {
   const route = signals.route || signals.label || 'unknown';
   const routeCooldown = isRouteOnCooldown(route);
   if (routeCooldown) {
-    console.log(`[${strat.id}] route cooldown ${route} (${(routeCooldown / 60000).toFixed(0)}m remaining)`);
-    return;
+    // Smart-money override: a token with strong smart_degen/sniper presence is a
+    // different beast from whatever rugged the route. Don't let a blanket route
+    // cooldown blind the sniper to a high-conviction runner. Mint cooldown still
+    // applies (checked above) so we never re-buy the exact loser.
+    const sd = Number(base.trending?.smart_degen_count ?? base.metrics?.trendingSmartDegenCount ?? 0);
+    const snp = Number(base.trending?.sniper_count ?? 0);
+    const bypassSd = numSetting('route_cooldown_bypass_smart_degen', 0);
+    const bypassSnp = numSetting('route_cooldown_bypass_sniper', 0);
+    const bypass = (bypassSd > 0 && sd >= bypassSd) || (bypassSnp > 0 && snp >= bypassSnp);
+    if (bypass) {
+      console.log(`[${strat.id}] route cooldown ${route} BYPASSED for ${signals.mint.slice(0, 8)} (sd=${sd}/snp=${snp})`);
+    } else {
+      console.log(`[${strat.id}] route cooldown ${route} (${(routeCooldown / 60000).toFixed(0)}m remaining)`);
+      return;
+    }
   }
 
   const candidate = filterForStrategy(base, strat);
