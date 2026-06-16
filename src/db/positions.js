@@ -6,17 +6,23 @@ export function openPositions() {
   return db.prepare('SELECT * FROM dry_run_positions WHERE status = ? ORDER BY opened_at_ms DESC').all('open');
 }
 
-export function openPositionCount() {
+export function openPositionCount(strategyId = null) {
+  if (strategyId) {
+    return db.prepare('SELECT COUNT(*) AS count FROM dry_run_positions WHERE status = ? AND strategy_id = ?').get('open', strategyId).count;
+  }
   return db.prepare('SELECT COUNT(*) AS count FROM dry_run_positions WHERE status = ?').get('open').count;
 }
 
 export function canOpenMorePositions(strat = null) {
-  let max;
+  // Per-strategy budget: when a strategy sets its own max_open_positions, count
+  // only that strategy's open positions so isolated lanes (e.g. "early") don't
+  // eat the sniper's slots and vice versa.
   if (strat && strat.max_open_positions != null) {
-    max = strat.max_open_positions;
-  } else {
-    max = numSetting('max_open_positions', 3);
+    const max = strat.max_open_positions;
+    if (max <= 0) return true;
+    return openPositionCount(strat.id) < max;
   }
+  const max = numSetting('max_open_positions', 3);
   if (max <= 0) return true;
   return openPositionCount() < max;
 }

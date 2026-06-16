@@ -24,14 +24,14 @@ setDegenHandler(maybeProcessDegenCandidate);
 setCandidateHandler(processCandidateFromSignals);
 
 async function processForStrategy(signals, strat, base) {
-  if (!canOpenMorePositions()) {
+  if (!canOpenMorePositions(strat)) {
     // If replace-weakest is enabled (and this strat is eligible), don't drop the
     // signal here — let it flow through filters/decision and evict at the BUY gate.
     const replaceEligible = boolSetting('replace_weakest_when_full', false)
       && (!boolSetting('replace_only_sniper', true) || strat.id === 'sniper');
     if (!replaceEligible) {
-      const max = numSetting('max_open_positions', 3);
-      console.log(`[${strat.id}] max positions (${openPositionCount()}/${max}), skip ${signals.mint.slice(0, 8)}`);
+      const max = strat.max_open_positions ?? numSetting('max_open_positions', 3);
+      console.log(`[${strat.id}] max positions (${openPositionCount(strat.max_open_positions != null ? strat.id : null)}/${max}), skip ${signals.mint.slice(0, 8)}`);
       return;
     }
   }
@@ -126,16 +126,17 @@ async function processForStrategy(signals, strat, base) {
   const minConfidence = numSetting('llm_min_confidence', 60);
 
   if (selectedRow && agentEnabled && batchDecision.verdict === 'BUY' && batchDecision.confidence >= minConfidence) {
-    if (!canOpenMorePositions()) {
+    if (!canOpenMorePositions(strat)) {
       // Try replace-weakest-when-full before giving up the slot.
       const evicted = await evictWeakestForEntry(strat);
-      if (!evicted || !canOpenMorePositions()) {
-        const max = numSetting('max_open_positions', 3);
-        console.log(`[${strat.id}] max positions (${openPositionCount()}/${max}), skip buy ${selectedRow.candidate.token.mint}`);
+      if (!evicted || !canOpenMorePositions(strat)) {
+        const stratScoped = strat.max_open_positions != null;
+        const max = strat.max_open_positions ?? numSetting('max_open_positions', 3);
+        console.log(`[${strat.id}] max positions (${openPositionCount(stratScoped ? strat.id : null)}/${max}), skip buy ${selectedRow.candidate.token.mint}`);
         logDecisionEvent({
           batchId, triggerCandidateId: candidateId, selectedRow, rows, decision: batchDecision,
           action: 'entry_skipped_max_positions',
-          guardrails: { maxOpenPositions: max, openPositions: openPositionCount(), strategy: strat.id, replaceAttempted: Boolean(boolSetting('replace_weakest_when_full', false)) },
+          guardrails: { maxOpenPositions: max, openPositions: openPositionCount(stratScoped ? strat.id : null), strategy: strat.id, replaceAttempted: Boolean(boolSetting('replace_weakest_when_full', false)) },
         });
         return;
       }
@@ -162,9 +163,10 @@ function dedupKey(mint, stratId, bucket) {
 export async function processCandidateFromSignals(signals) {
   const strats = allEnabledStrategies();
   if (strats.length === 0) return;
-  if (!canOpenMorePositions()) {
-    // Only short-circuit here if replace-weakest is OFF (or no enabled strat is
-    // eligible). Otherwise let strategies run so the BUY gate can evict.
+  // Only short-circuit here if NO enabled strategy can still open a position
+  // (each judged against its own per-lane budget) AND replace-weakest can't help.
+  const anyHasRoom = strats.some(s => canOpenMorePositions(s));
+  if (!anyHasRoom) {
     const anyReplaceEligible = boolSetting('replace_weakest_when_full', false)
       && (!boolSetting('replace_only_sniper', true) || strats.some(s => s.id === 'sniper'));
     if (!anyReplaceEligible) {
