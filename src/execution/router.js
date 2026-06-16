@@ -63,10 +63,11 @@ export async function executeConfirmedIntent(chatId, intentId) {
   }
   const { decision } = intent.payload;
   try {
+    const intentStrat = intent.payload?.candidate?.signals?.strategy || null;
     const freshRow = await refreshCandidateForExecution({
       id: intent.candidate_id,
       candidate: intent.payload.candidate,
-    });
+    }, intentStrat);
     if (!freshRow.candidate.filters?.passed) {
       db.prepare('UPDATE trade_intents SET status = ?, updated_at_ms = ? WHERE id = ?').run('rejected_stale', now(), intentId);
       return bot.sendMessage(chatId, [

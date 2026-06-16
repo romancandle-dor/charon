@@ -104,6 +104,10 @@ async function jupiterExecute(order, signedTransaction) {
 }
 
 export async function executeJupiterSwap({ inputMint, outputMint, amount }) {
+  if (process.env.TRADING_MODE === 'dry_run') {
+    console.log(`[dry_run] would swap ${amount} ${inputMint} → ${outputMint}`);
+    return { outputAmount: '0', txid: 'dry_run_skip' };
+  }
   const order = await jupiterOrder({ inputMint, outputMint, amount });
   const transaction = orderTransactionBase64(order);
   if (!transaction) throw new Error('Jupiter order did not include a transaction.');

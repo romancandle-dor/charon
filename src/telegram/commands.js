@@ -21,13 +21,14 @@ import {
   strategyMenuText,
   strategyKeyboard,
 } from './menus.js';
-import { sendTelegram, sendBatch, sendPositionOpen } from './send.js';
+import { sendTelegram, sendBatch, sendPositionOpen, sendPnl } from './send.js';
 import { candidateSummary, formatPosition } from './format.js';
 import { refreshPosition } from '../execution/positions.js';
 import { executeLiveSell } from '../execution/router.js';
 import { handleCallback, editMenuMessage } from './callbacks.js';
 import { consumeNumericFilterInput } from './input.js';
 import { runLearning, sendLessons } from '../learning/commands.js';
+import { activeCooldowns, clearCooldown } from '../db/cooldowns.js';
 import { fetchWalletPnl } from '../enrichment/wallets.js';
 
 export async function handleMessage(msg) {
@@ -81,6 +82,21 @@ export async function handleMessage(msg) {
     return runLearning(chatId, windowArg);
   }
   if (text.startsWith('/lessons')) return sendLessons(chatId);
+  if (text.startsWith('/cooldowns')) {
+    const parts = text.split(/\s+/);
+    if (parts[1] === 'clear' && parts[2]) {
+      clearCooldown(parts[2]);
+      return bot.sendMessage(chatId, `Cleared cooldown for ${parts[2]}`);
+    }
+    const list = activeCooldowns();
+    if (!list.length) return bot.sendMessage(chatId, 'No active cooldowns.');
+    const lines = list.map(c => {
+      const remaining = Math.max(0, Math.ceil((c.cooldown_until_ms - now()) / 60000));
+      const mintOrRoute = c.mint || c.route;
+      return `${mintOrRoute.slice(0, 8)}... ${remaining}m left (${c.reason})`;
+    });
+    return bot.sendMessage(chatId, `🧊 <b>Cooldowns (${list.length})</b>\n${lines.join('\n')}`, { parse_mode: 'HTML' });
+  }
   if (text.startsWith('/candidate')) {
     const mint = text.split(/\s+/)[1];
     if (!mint) return bot.sendMessage(chatId, 'Usage: /candidate <mint>');
@@ -268,29 +284,6 @@ async function sendMenu(chatId = TELEGRAM_CHAT_ID) {
   });
 }
 
-async function sendPnl(chatId, query = null) {
-  const wallets = savedWallets();
-  if (!wallets.length) {
-    const text = '📊 <b>PnL</b>\n\nNo saved wallets. Use /walletadd &lt;label&gt; &lt;address&gt;.';
-    return query ? editMenuMessage(query, text, navKeyboard()) : bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
-  }
-  const chunks = [];
-  for (const wallet of wallets) {
-    const pnl = await fetchWalletPnl(wallet.address).catch(() => null);
-    if (!pnl) {
-      chunks.push(`• <b>${escapeHtml(wallet.label)}</b>: no data`);
-      continue;
-    }
-    chunks.push([
-      `• <b>${escapeHtml(wallet.label)}</b>`,
-      `Win: ${fmtPct(pnl.winRate)} · PnL: ${fmtPct(pnl.totalPnlPercent)}`,
-      `Trades: ${pnl.totalTrades} · Wins: ${pnl.wins}`,
-    ].join('\n'));
-  }
-  const text = `📊 <b>PnL</b>\n\n${chunks.join('\n\n')}`;
-  return query ? editMenuMessage(query, text, navKeyboard()) : bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
-}
-
 function parseSetFilter(text) {
   const parts = text.trim().split(/\s+/);
   return { key: parts[1], value: parts[2] };
@@ -298,8 +291,4 @@ function parseSetFilter(text) {
 
 function allPositions(limit = 10) {
   return db.prepare('SELECT * FROM dry_run_positions ORDER BY id DESC LIMIT ?').all(limit);
-}
-
-function savedWallets() {
-  return db.prepare('SELECT * FROM saved_wallets ORDER BY label').all();
 }

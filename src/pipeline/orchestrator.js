@@ -2,13 +2,14 @@ import { now, pruneSeen } from '../utils.js';
 import { numSetting, boolSetting } from '../db/settings.js';
 import { upsertCandidate, updateCandidateStatus, recentEligibleCandidates, candidateById } from '../db/candidates.js';
 import { storeDecision, storeBatchDecision, logDecisionEvent } from '../db/decisions.js';
-import { buildCandidate, filterCandidate, signalLabel } from './candidateBuilder.js';
+import { enrichCandidate, filterForStrategy } from './candidateBuilder.js';
 import { decideCandidateBatch } from './llm.js';
-import { activeStrategy } from '../db/settings.js';
+import { allEnabledStrategies } from '../db/settings.js';
 import { createDryRunPosition, createLivePosition, canOpenMorePositions, openPositionCount, tradingMode } from '../db/positions.js';
 import { sendBatchReveal, sendTelegram, sendPositionOpen, sendTradeIntent } from '../telegram/send.js';
 import { candidateSummary } from '../telegram/format.js';
 import { createTradeIntent } from '../db/intents.js';
+import { isMintOnCooldown, isRouteOnCooldown } from '../db/cooldowns.js';
 import { refreshCandidateForExecution } from '../execution/positions.js';
 import { executeLiveBuy } from '../execution/router.js';
 import { graduated } from '../signals/graduated.js';
@@ -22,23 +23,35 @@ export const seenSignalCandidates = new Map();
 setDegenHandler(maybeProcessDegenCandidate);
 setCandidateHandler(processCandidateFromSignals);
 
-export async function processCandidateFromSignals(signals) {
-  // Skip if max positions reached — don't waste enrichment/LLM calls
+async function processForStrategy(signals, strat, base) {
   if (!canOpenMorePositions()) {
     const max = numSetting('max_open_positions', 3);
-    console.log(`[agent] max positions reached (${openPositionCount()}/${max}), skipping ${signals.mint.slice(0, 8)}...`);
+    console.log(`[${strat.id}] max positions (${openPositionCount()}/${max}), skip ${signals.mint.slice(0, 8)}`);
     return;
   }
 
-  const candidate = await buildCandidate(signals);
+  const mintCooldown = isMintOnCooldown(signals.mint);
+  if (mintCooldown) {
+    console.log(`[${strat.id}] cooldown ${signals.mint.slice(0, 8)} (${(mintCooldown / 60000).toFixed(0)}m remaining)`);
+    return;
+  }
+
+  const route = signals.route || signals.label || 'unknown';
+  const routeCooldown = isRouteOnCooldown(route);
+  if (routeCooldown) {
+    console.log(`[${strat.id}] route cooldown ${route} (${(routeCooldown / 60000).toFixed(0)}m remaining)`);
+    return;
+  }
+
+  const candidate = filterForStrategy(base, strat);
   const signature = signals.signature || null;
   const candidateId = upsertCandidate(candidate, signature);
+
   if (!candidate.filters.passed) {
-    console.log(`[candidate] filtered ${candidate.token.mint.slice(0, 8)}... ${candidate.filters.failures.join('; ')}`);
+    console.log(`[${strat.id}] filtered ${candidate.token.mint.slice(0, 8)}... ${candidate.filters.failures.join('; ')}`);
     return;
   }
 
-  const strat = activeStrategy();
   let rows, batchDecision, batchId;
 
   if (!strat.use_llm) {
@@ -62,6 +75,7 @@ export async function processCandidateFromSignals(signals) {
     batchDecision = await decideCandidateBatch(rows, candidateId);
     batchId = storeBatchDecision(candidateId, rows, batchDecision);
   }
+
   const selectedRow = batchDecision.selected_row;
   const selectedThisCandidate = selectedRow?.id === candidateId;
   const currentDecision = selectedThisCandidate
@@ -73,12 +87,14 @@ export async function processCandidateFromSignals(signals) {
           ? `Batch #${batchId} screened ${rows.length}; selected ${short(selectedRow.candidate.token.mint)} instead. ${batchDecision.reason || ''}`.trim()
           : `Batch #${batchId} screened ${rows.length}; no buy selected. ${batchDecision.reason || ''}`.trim(),
       };
-  const currentDecisionId = storeDecision(candidateId, candidate, currentDecision);
+
+  const stratLabel = strat.name || strat.id;
+  const currentDecisionId = storeDecision(candidateId, candidate, { ...currentDecision, strategy_id: strat.id });
   currentDecision.id = currentDecisionId;
   updateCandidateStatus(candidateId, currentDecision.verdict.toLowerCase());
 
   if (selectedRow && !selectedThisCandidate) {
-    const selectedDecisionId = storeDecision(selectedRow.id, selectedRow.candidate, batchDecision);
+    const selectedDecisionId = storeDecision(selectedRow.id, selectedRow.candidate, { ...batchDecision, strategy_id: strat.id });
     batchDecision.id = selectedDecisionId;
     updateCandidateStatus(selectedRow.id, batchDecision.verdict.toLowerCase());
   } else if (selectedThisCandidate) {
@@ -87,43 +103,68 @@ export async function processCandidateFromSignals(signals) {
 
   if (batchId) await sendBatchReveal(batchId, rows, batchDecision, candidateId);
 
-  if (selectedRow && boolSetting('agent_enabled', true) && batchDecision.verdict === 'BUY' && batchDecision.confidence >= numSetting('llm_min_confidence', 75)) {
+  const agentEnabled = boolSetting('agent_enabled', true);
+  const minConfidence = numSetting('llm_min_confidence', 60);
+
+  if (selectedRow && agentEnabled && batchDecision.verdict === 'BUY' && batchDecision.confidence >= minConfidence) {
     if (!canOpenMorePositions()) {
       const max = numSetting('max_open_positions', 3);
-      console.log(`[agent] max open positions reached (${openPositionCount()}/${max}), skipping buy ${selectedRow.candidate.token.mint}`);
+      console.log(`[${strat.id}] max positions (${openPositionCount()}/${max}), skip buy ${selectedRow.candidate.token.mint}`);
       logDecisionEvent({
-        batchId,
-        triggerCandidateId: candidateId,
-        selectedRow,
-        rows,
-        decision: batchDecision,
+        batchId, triggerCandidateId: candidateId, selectedRow, rows, decision: batchDecision,
         action: 'entry_skipped_max_positions',
-        guardrails: { maxOpenPositions: max, openPositions: openPositionCount() },
+        guardrails: { maxOpenPositions: max, openPositions: openPositionCount(), strategy: strat.id },
       });
       return;
     }
-    await handleApprovedBuy(selectedRow, batchDecision, batchId, rows, candidateId);
+    await handleApprovedBuy(selectedRow, batchDecision, batchId, rows, candidateId, strat);
   } else {
     logDecisionEvent({
-      batchId,
-      triggerCandidateId: candidateId,
-      selectedRow,
-      rows,
-      decision: batchDecision,
+      batchId, triggerCandidateId: candidateId, selectedRow, rows, decision: batchDecision,
       action: selectedRow ? 'entry_not_approved' : 'no_candidate_selected',
       guardrails: {
-        agentEnabled: boolSetting('agent_enabled', true),
-        confidenceThreshold: numSetting('llm_min_confidence', 75),
-        openPositions: openPositionCount(),
-        maxOpenPositions: numSetting('max_open_positions', 3),
+        agentEnabled, confidenceThreshold: minConfidence,
+        openPositions: openPositionCount(), maxOpenPositions: numSetting('max_open_positions', 3),
+        strategy: strat.id,
       },
     });
   }
 }
 
-export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [], triggerCandidateId = null) {
+function dedupKey(mint, stratId, bucket) {
+  return `${stratId}:${mint}:${bucket}`;
+}
+
+export async function processCandidateFromSignals(signals) {
+  const strats = allEnabledStrategies();
+  if (strats.length === 0) return;
+  if (!canOpenMorePositions()) {
+    const max = numSetting('max_open_positions', 3);
+    console.log(`[agent] max positions (${openPositionCount()}/${max}), skip ${signals.mint.slice(0, 8)}`);
+    return;
+  }
+
+  const bucket = Math.floor(now() / (10 * 60 * 1000));
+  pruneSeen(seenSignalCandidates, 30 * 60 * 1000);
+
+  const deduplicated = strats.filter(s => {
+    const key = dedupKey(signals.mint, s.id, bucket);
+    if (seenSignalCandidates.has(key)) return false;
+    seenSignalCandidates.set(key, now());
+    return true;
+  });
+  if (deduplicated.length === 0) return;
+
+  const base = await enrichCandidate(signals);
+  for (const strat of deduplicated) {
+    await processForStrategy(signals, strat, base);
+  }
+}
+
+export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [], triggerCandidateId = null, strat = null) {
   const mode = tradingMode();
-  const freshSelectedRow = await refreshCandidateForExecution(selectedRow);
+  if (!strat) strat = { id: 'unknown', position_size_sol: numSetting('dry_run_buy_sol', 0.1), tp_percent: numSetting('default_tp_percent', 50), sl_percent: numSetting('default_sl_percent', -25), trailing_enabled: boolSetting('default_trailing_enabled', true), trailing_percent: numSetting('default_trailing_percent', 20) };
+  const freshSelectedRow = await refreshCandidateForExecution(selectedRow, strat);
   const executionRows = rows.map(row => row.id === freshSelectedRow.id ? freshSelectedRow : row);
   if (!freshSelectedRow.candidate.filters?.passed) {
     updateCandidateStatus(freshSelectedRow.id, 'stale_rejected');
@@ -151,7 +192,7 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
   }
 
   if (mode === 'dry_run') {
-    const positionId = await createDryRunPosition(freshSelectedRow.id, freshSelectedRow.candidate, decision, `llm_batch_${batchId}`);
+    const positionId = await createDryRunPosition(freshSelectedRow.id, freshSelectedRow.candidate, decision, `llm_batch_${batchId}`, strat);
     logDecisionEvent({
       batchId,
       triggerCandidateId,
@@ -160,7 +201,7 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
       decision,
       mode,
       action: 'dry_run_entry',
-      guardrails: { maxOpenPositions: numSetting('max_open_positions', 3), openPositions: openPositionCount() },
+      guardrails: { maxOpenPositions: numSetting('max_open_positions', 3), openPositions: openPositionCount(), strategy: strat.id },
       execution: { positionId },
     });
     await sendPositionOpen(positionId);
@@ -177,7 +218,7 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
       decision,
       mode,
       action: 'confirm_intent_created',
-      guardrails: { maxOpenPositions: numSetting('max_open_positions', 3), openPositions: openPositionCount() },
+      guardrails: { maxOpenPositions: numSetting('max_open_positions', 3), openPositions: openPositionCount(), strategy: strat.id },
       execution: { intentId },
     });
     await sendTradeIntent(intentId, freshSelectedRow.candidate, decision);
@@ -196,7 +237,7 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
       decision,
       mode,
       action: 'live_entry_failed',
-      guardrails: { maxOpenPositions: numSetting('max_open_positions', 3), openPositions: openPositionCount() },
+      guardrails: { maxOpenPositions: numSetting('max_open_positions', 3), openPositions: openPositionCount(), strategy: strat.id },
       execution: { intentId, error: err.message },
     });
     await sendTelegram([
@@ -212,17 +253,16 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
 
 export async function maybeProcessDegenCandidate(mint, trendingToken) {
   if (!boolSetting('trending_allow_degen', false)) return;
-  const graduatedCoin = graduated.get(mint);
-  if (!graduatedCoin) return;
   pruneSeen(seenSignalCandidates, 10 * 60 * 1000);
   const bucket = Math.floor(now() / (5 * 60 * 1000));
-  const key = `graduated_trending:${mint}:${bucket}`;
+  const key = `trending:${mint}:${bucket}`;
   if (seenSignalCandidates.has(key)) return;
   seenSignalCandidates.set(key, now());
+  const graduatedCoin = graduated.get(mint);
   await processCandidateFromSignals({
     mint,
-    graduatedCoin,
+    graduatedCoin: graduatedCoin || null,
     trendingToken,
-    route: 'graduated_trending',
+    route: graduatedCoin ? 'graduated_trending' : 'trending',
   });
 }

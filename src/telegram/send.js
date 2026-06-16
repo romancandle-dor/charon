@@ -5,8 +5,9 @@ import { db } from '../db/connection.js';
 import { escapeHtml, fmtPct, fmtSol, fmtUsd, short, gmgnLink } from '../format.js';
 import { numSetting } from '../db/settings.js';
 import { candidateSummary, compactCandidateLine, batchRevealSummary, formatPosition } from './format.js';
-import { candidateButtons, batchRevealButtons, positionButtons, intentButtons } from './menus.js';
+import { candidateButtons, batchRevealButtons, positionButtons, intentButtons, navKeyboard } from './menus.js';
 import { batchById } from '../db/decisions.js';
+import { fetchWalletPnl } from '../enrichment/wallets.js';
 
 export async function sendTelegram(text, extra = {}) {
   return bot.sendMessage(TELEGRAM_CHAT_ID, text, {
@@ -75,6 +76,81 @@ export async function sendPositionOpen(positionId) {
 export async function sendPositionExit(position) {
   const label = position?.execution_mode === 'live' ? 'Live exit' : 'Dry-run exit';
   await sendTelegram(`🏁 <b>${label}: ${escapeHtml(position.exitReason)}</b>\n\n${formatPosition({ ...position, status: 'closed' })}`);
+}
+
+export async function sendPnl(chatId, query = null) {
+  const sections = [];
+
+  // Dry-run PnL from local DB
+  const closed = db.prepare("SELECT * FROM dry_run_positions WHERE status='closed' AND pnl_percent IS NOT NULL").all();
+  if (closed.length) {
+    const totalPnlSol = closed.reduce((s, p) => s + Number(p.pnl_sol || 0), 0);
+    const totalPnlPct = closed.reduce((s, p) => s + Number(p.pnl_percent || 0), 0);
+    const wins = closed.filter(p => Number(p.pnl_percent || 0) > 0).length;
+    const losses = closed.filter(p => Number(p.pnl_percent || 0) < 0).length;
+    const winRate = (wins / closed.length) * 100;
+    const best = [...closed].sort((a, b) => Number(b.pnl_percent || 0) - Number(a.pnl_percent || 0))[0];
+    const worst = [...closed].sort((a, b) => Number(a.pnl_percent || 0) - Number(b.pnl_percent || 0))[0];
+    const totalEmoji = totalPnlSol > 0 ? '🟢' : totalPnlSol < 0 ? '🔴' : '⚪';
+    sections.push([
+      `🏜️ <b>Dry-Run (${closed.length} closed)</b>`,
+      `Win: ${fmtPct(winRate)} (${wins}W/${losses}L) · Avg: ${fmtPct(totalPnlPct / closed.length)}`,
+      `${totalEmoji} Total: <b>${fmtPct(totalPnlPct)}</b> (${fmtSol(totalPnlSol)} SOL)`,
+      best ? `Best: #${best.id} ${escapeHtml(best.symbol || '')} ${fmtPct(best.pnl_percent)} (${best.exit_reason})` : null,
+      worst ? `Worst: #${worst.id} ${escapeHtml(worst.symbol || '')} ${fmtPct(worst.pnl_percent)} (${worst.exit_reason})` : null,
+    ].filter(Boolean).join('\n'));
+  }
+
+  // Live wallet PnL from Jupiter (skip if dry_run mode only)
+  const wallets = db.prepare('SELECT * FROM saved_wallets ORDER BY label').all();
+  if (wallets.length) {
+    const walletChunks = [];
+    for (const wallet of wallets) {
+      const pnl = await fetchWalletPnl(wallet.address).catch(() => null);
+      if (!pnl || !pnl.totalTrades) {
+        walletChunks.push(`• <b>${escapeHtml(wallet.label)}</b>: no live trades yet`);
+        continue;
+      }
+      const winEmoji = (pnl.winRate || 0) >= 50 ? '✅' : '📉';
+      const pnlEmoji = (pnl.totalPnlPercent || 0) > 0 ? '🟢' : (pnl.totalPnlPercent || 0) < 0 ? '🔴' : '⚪';
+      walletChunks.push([
+        `• ${winEmoji} <b>${escapeHtml(wallet.label)}</b>`,
+        `  Win: ${fmtPct(pnl.winRate)} · ${pnlEmoji} PnL: <b>${fmtPct(pnl.totalPnlPercent)}</b>`,
+        `  Buys: ${pnl.totalTrades} · Wins: ${pnl.wins}`,
+      ].join('\n'));
+    }
+    if (walletChunks.length) sections.push(`💧 <b>Live Wallets</b>\n\n${walletChunks.join('\n\n')}`);
+  }
+
+  const text = sections.length
+    ? `📊 <b>PnL Overview</b>\n\n${sections.join('\n\n')}`
+    : '📊 <b>PnL</b>\n\nNo data yet. Dry-run positions akan muncul setelah ada yang close.';
+
+  return sendOrEdit(chatId, query, text, navKeyboard());
+}
+
+async function sendOrEdit(chatId, query, text, extra = {}) {
+  if (query) {
+    const messageId = query.message?.message_id;
+    if (messageId) {
+      try {
+        return await bot.editMessageText(text, {
+          chat_id: chatId,
+          message_id: messageId,
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+          ...extra,
+        });
+      } catch (err) {
+        if (/message is not modified/i.test(err.message)) return null;
+      }
+    }
+  }
+  return bot.sendMessage(chatId, text, {
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    ...extra,
+  });
 }
 
 export async function sendTradeIntent(intentId, candidate, decision) {

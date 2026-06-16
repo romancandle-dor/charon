@@ -3,10 +3,11 @@ import { now, safeJson, json } from '../utils.js';
 import { numSetting } from './settings.js';
 
 export function candidateSignalKey(candidate, signature = null) {
-  if (signature) return `${signature}:${candidate.token.mint}`;
+  const strat = candidate.signals?.strategy || 'default';
+  if (signature) return `${strat}:${signature}:${candidate.token.mint}`;
   const route = candidate.signals?.route || 'signal';
   const bucket = Math.floor(Number(candidate.createdAtMs || now()) / (5 * 60 * 1000));
-  return `${route}:${candidate.token.mint}:${bucket}`;
+  return `${strat}:${route}:${candidate.token.mint}:${bucket}`;
 }
 
 export function upsertCandidate(candidate, signature) {
@@ -28,11 +29,13 @@ export function upsertCandidate(candidate, signature) {
       return existing.id;
     }
 
+    const strat = candidate.signals?.strategy || 'sniper';
     const result = db.prepare(`
-      INSERT INTO candidates (mint, status, created_at_ms, updated_at_ms, signature, signal_key, candidate_json, filter_result_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO candidates (mint, strategy, status, created_at_ms, updated_at_ms, signature, signal_key, candidate_json, filter_result_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       candidate.token.mint,
+      strat,
       candidate.filters.passed ? 'candidate' : 'filtered',
       now(),
       now(),

@@ -21,7 +21,7 @@ export async function fetchSavedWalletExposure(mint, holders) {
 
 export async function fetchWalletPnl(address) {
   try {
-    const url = `https://datapi.jup.ag/v1/pnl?addresses=${encodeURIComponent(address)}&includeClosed=false`;
+    const url = `https://datapi.jup.ag/v1/pnl?addresses=${encodeURIComponent(address)}&includeClosed=true`;
     const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
     if (!res.ok) return null;
     const data = await res.json();

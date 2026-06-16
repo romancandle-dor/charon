@@ -12,6 +12,10 @@ import { updateCandidateSnapshot } from '../db/candidates.js';
 import { trending } from '../signals/trending.js';
 import { executeLiveSell } from './router.js';
 import { sendPositionExit } from '../telegram/send.js';
+import { autoLearning } from '../learning/lessons.js';
+import { applyCooldownOnClose, clearExpiredCooldowns } from '../db/cooldowns.js';
+import { recordPositionSignals } from '../db/weights.js';
+import { evolveThresholds } from '../db/thresholds.js';
 
 export async function freshEntryMarket(mint, candidate) {
   const gmgn = await fetchGmgnTokenInfo(mint, false);
@@ -27,7 +31,7 @@ export async function freshEntryMarket(mint, candidate) {
   return { gmgn, asset, priceUsd, marketCapUsd, refreshedAtMs: now() };
 }
 
-export async function refreshCandidateForExecution(row) {
+export async function refreshCandidateForExecution(row, strat = null) {
   const candidate = row.candidate;
   const mint = candidate.token.mint;
   const gmgn = await fetchGmgnTokenInfo(mint, false);
@@ -86,7 +90,7 @@ export async function refreshCandidateForExecution(row) {
       holdersRefreshed: Boolean(holders?.holders?.length),
     },
   };
-  refreshed.filters = filterCandidate(refreshed);
+  refreshed.filters = filterCandidate(refreshed, strat);
   const executionFailures = [];
   if (!Number.isFinite(Number(refreshed.metrics.marketCapUsd)) || Number(refreshed.metrics.marketCapUsd) <= 0) {
     executionFailures.push('execution mcap: missing');
@@ -244,6 +248,7 @@ export async function monitorPositions() {
   if (pubkey && positions.some(p => p.execution_mode === 'live')) {
     walletPnlData = await fetchJupiterWalletPnl(pubkey);
   }
+  clearExpiredCooldowns();
   for (const position of positions) {
     const jupiterPnl = position.execution_mode === 'live'
       ? (walletPnlData[position.mint]?.pnl || null)
@@ -252,6 +257,12 @@ export async function monitorPositions() {
       console.log(`[position] ${position.id} ${err.message}`);
       return null;
     });
-    if (result?.exitReason) await sendPositionExit(result);
+    if (result?.exitReason) {
+      await sendPositionExit(result);
+      applyCooldownOnClose(result);
+      recordPositionSignals(result);
+      evolveThresholds();
+      autoLearning().catch(() => {});
+    }
   }
 }

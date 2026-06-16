@@ -27,8 +27,8 @@ export function signalLabel(signals = {}) {
   ].filter(Boolean).join(' + ') || signals.route || 'unknown';
 }
 
-export function filterCandidate(candidate) {
-  const strat = activeStrategy();
+export function filterCandidate(candidate, strat) {
+  if (!strat) strat = activeStrategy();
   const failures = [];
   const mcap = candidate.metrics.marketCapUsd;
   const totalFees = candidate.metrics.gmgnTotalFeesSol;
@@ -115,30 +115,18 @@ export function filterCandidate(candidate) {
   return { passed: failures.length === 0, failures, strategy: strat.id };
 }
 
-export async function buildCandidate({ mint, fee = null, signature = null, graduatedCoin = null, trendingToken = null, route }) {
-  const strat = activeStrategy();
-  const gmgn = await fetchGmgnTokenInfo(mint);
-  const jupiterAsset = await fetchJupiterAsset(mint);
-  const holders = await fetchJupiterHolders(mint);
-  const chart = await fetchJupiterChartContext(mint);
-  const savedWalletExposure = await fetchSavedWalletExposure(mint, holders);
-  const twitterNarrative = await fetchTwitterNarrative(graduatedCoin || jupiterAsset, gmgn);
-  const priceUsd = firstPositiveNumber(tokenPriceFromGmgn(gmgn), jupiterAsset?.usdPrice, trendingToken?.price);
-  const marketCapUsd = firstPositiveNumber(
-    marketCapFromGmgn(gmgn),
-    jupiterAsset?.mcap,
-    jupiterAsset?.fdv,
-    trendingToken?.market_cap,
-    graduatedCoin?.marketCap,
-    graduatedCoin?.usd_market_cap,
-  );
-  const signalRoute = route || [
-    fee ? 'fee' : null,
-    graduatedCoin ? 'graduated' : null,
-    trendingToken ? 'trending' : null,
-  ].filter(Boolean).join('_');
+async function enrichData(mint, jupiterAsset) {
+  const [gmgn, chart] = await Promise.all([
+    fetchGmgnTokenInfo(mint).catch(() => null),
+    fetchJupiterChartContext(mint).catch(() => null),
+  ]);
+  const twitterNarrative = await fetchTwitterNarrative(jupiterAsset, gmgn).catch(() => ({}));
+  return { gmgn, chart, twitterNarrative };
+}
 
-  const candidate = {
+function buildBaseCandidate(mint, signals, enriched, graduatedCoin, trendingToken, jupiterAsset, holders, savedWalletExposure) {
+  const { gmgn, chart, twitterNarrative } = enriched;
+  return {
     token: {
       mint,
       name: gmgn?.name || jupiterAsset?.name || trendingToken?.name || graduatedCoin?.name || '',
@@ -149,8 +137,19 @@ export async function buildCandidate({ mint, fee = null, signature = null, gradu
       telegram: graduatedCoin?.telegram || gmgn?.link?.telegram || '',
     },
     metrics: {
-      priceUsd,
-      marketCapUsd,
+      priceUsd: firstPositiveNumber(
+        tokenPriceFromGmgn(gmgn),
+        jupiterAsset?.usdPrice,
+        trendingToken?.price,
+      ),
+      marketCapUsd: firstPositiveNumber(
+        marketCapFromGmgn(gmgn),
+        jupiterAsset?.mcap,
+        jupiterAsset?.fdv,
+        trendingToken?.market_cap,
+        graduatedCoin?.marketCap,
+        graduatedCoin?.usd_market_cap,
+      ),
       liquidityUsd: Number(gmgn?.liquidity ?? jupiterAsset?.liquidity ?? trendingToken?.liquidity ?? 0),
       holderCount: Number(gmgn?.holder_count ?? jupiterAsset?.holderCount ?? trendingToken?.holder_count ?? graduatedCoin?.numHolders ?? 0),
       gmgnTotalFeesSol: Number(gmgn?.total_fee ?? jupiterAsset?.fees ?? 0),
@@ -162,22 +161,10 @@ export async function buildCandidate({ mint, fee = null, signature = null, gradu
       trendingHotLevel: Number(trendingToken?.hot_level ?? 0),
       trendingSmartDegenCount: Number(trendingToken?.smart_degen_count ?? 0),
     },
-    signals: {
-      route: signalRoute,
-      label: signalLabel({
-        hasFeeClaim: Boolean(fee),
-        hasGraduated: Boolean(graduatedCoin),
-        hasTrending: Boolean(trendingToken),
-      }),
-      hasFeeClaim: Boolean(fee),
-      hasGraduated: Boolean(graduatedCoin),
-      hasTrending: Boolean(trendingToken),
-      triggerSignature: signature,
-      strategy: strat.id,
-    },
+    signals,
     graduation: graduatedCoin,
     trending: trendingToken,
-    feeClaim: fee ? buildFeeSnapshot(fee, signature) : null,
+    feeClaim: signals.hasFeeClaim && signals.feeData ? buildFeeSnapshot(signals.feeData, signals.triggerSignature) : null,
     gmgn,
     jupiterAsset,
     holders,
@@ -186,6 +173,40 @@ export async function buildCandidate({ mint, fee = null, signature = null, gradu
     twitterNarrative,
     createdAtMs: now(),
   };
-  candidate.filters = filterCandidate(candidate);
-  return candidate;
+}
+
+export function filterForStrategy(candidate, strat) {
+  const clone = { ...candidate, signals: { ...candidate.signals, strategy: strat.id } };
+  clone.filters = filterCandidate(clone, strat);
+  return clone;
+}
+
+export async function enrichCandidate({ mint, fee = null, signature = null, graduatedCoin = null, trendingToken = null, route }) {
+  const [jupiterAsset, holders] = await Promise.all([
+    fetchJupiterAsset(mint).catch(() => null),
+    fetchJupiterHolders(mint).catch(() => null),
+  ]);
+  const enriched = await enrichData(mint, jupiterAsset);
+  const savedWalletExposure = await fetchSavedWalletExposure(mint, holders).catch(() => ({}));
+  const signalRoute = route || [
+    fee ? 'fee' : null,
+    graduatedCoin ? 'graduated' : null,
+    trendingToken ? 'trending' : null,
+  ].filter(Boolean).join('_');
+  const signals = {
+    route: signalRoute,
+    label: signalLabel({ hasFeeClaim: Boolean(fee), hasGraduated: Boolean(graduatedCoin), hasTrending: Boolean(trendingToken) }),
+    hasFeeClaim: Boolean(fee),
+    hasGraduated: Boolean(graduatedCoin),
+    hasTrending: Boolean(trendingToken),
+    triggerSignature: signature,
+    feeData: fee,
+  };
+  return buildBaseCandidate(mint, signals, enriched, graduatedCoin, trendingToken, jupiterAsset, holders, savedWalletExposure);
+}
+
+export async function buildCandidate(signals) {
+  const base = await enrichCandidate(signals);
+  const strat = activeStrategy();
+  return filterForStrategy(base, strat);
 }

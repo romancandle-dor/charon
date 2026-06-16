@@ -19,6 +19,7 @@ export async function startCharon() {
   if (SIGNAL_SERVER_URL) {
     // ── Server mode: fetch signals from signal server ──────────────────────
     const { fetchServerSignals, setCandidateHandler, setDegenHandler } = await import('./signals/serverClient.js');
+    const { fetchGmgnTrending } = await import('./signals/trending.js');
 
     setCandidateHandler(processCandidateFromSignals);
     setDegenHandler(maybeProcessDegenCandidate);
@@ -26,9 +27,14 @@ export async function startCharon() {
     const alert = (msg) => sendTelegram(msg);
     const trackServer = makeFailureTracker('server signals', alert);
     const trackDip = makeFailureTracker('dip monitor', alert);
+    const trackTrending = makeFailureTracker('trending', alert);
 
     await fetchServerSignals().catch(error => console.log(`[server] initial fetch failed: ${error.message}`));
     setInterval(() => trackServer(() => fetchServerSignals()), SIGNAL_POLL_MS);
+
+    // Separate trending poll for non-fee signals (Scalper, Degen, Dip Buy, Smart Money)
+    await fetchGmgnTrending().catch(error => console.log(`[trending] initial fetch failed: ${error.message}`));
+    setInterval(() => trackTrending(() => fetchGmgnTrending()), TRENDING_POLL_MS);
 
     // Price monitor for dip buy strategy
     const { monitorPriceAlerts, cleanupAlerts } = await import('./signals/priceMonitor.js');

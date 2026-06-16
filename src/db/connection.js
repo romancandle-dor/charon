@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { DB_PATH } from '../config.js';
+import { ensureWeightsTable } from './weights.js';
 
 export const db = new Database(DB_PATH);
 
@@ -167,7 +168,9 @@ export function initDb() {
       created_at_ms INTEGER NOT NULL,
       status TEXT NOT NULL DEFAULT 'active',
       lesson TEXT NOT NULL,
-      evidence_json TEXT NOT NULL
+      evidence_json TEXT NOT NULL,
+      category TEXT DEFAULT 'general',
+      priority INTEGER DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS strategies (
       id TEXT PRIMARY KEY,
@@ -176,6 +179,19 @@ export function initDb() {
       config_json TEXT NOT NULL,
       created_at_ms INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS cooldowns (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      mint TEXT,
+      route TEXT,
+      strategy_id TEXT,
+      cooldown_until_ms INTEGER NOT NULL,
+      reason TEXT NOT NULL,
+      created_at_ms INTEGER NOT NULL,
+      close_pnl_percent REAL
+    );
+    CREATE INDEX IF NOT EXISTS idx_cooldowns_mint ON cooldowns(mint);
+    CREATE INDEX IF NOT EXISTS idx_cooldowns_route ON cooldowns(route);
+    CREATE INDEX IF NOT EXISTS idx_cooldowns_active ON cooldowns(cooldown_until_ms);
     CREATE TABLE IF NOT EXISTS price_alerts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       mint TEXT NOT NULL,
@@ -208,6 +224,9 @@ export function initDb() {
   ensureColumn('dry_run_positions', 'strategy_id', "TEXT DEFAULT 'sniper'");
   ensureColumn('dry_run_positions', 'partial_tp_done', 'INTEGER DEFAULT 0');
   ensureColumn('decision_logs', 'strategy_id', 'TEXT');
+  ensureColumn('learning_lessons', 'category', "TEXT DEFAULT 'general'");
+  ensureColumn('learning_lessons', 'priority', 'INTEGER DEFAULT 0');
+  ensureWeightsTable();
 
   const defaults = {
     agent_enabled: 'true',

@@ -35,3 +35,18 @@ export function txLink(signature) {
 export function accountLink(address) {
   return `https://solscan.io/account/${address}`;
 }
+
+export function fmtDuration(ms) {
+  const n = Math.abs(Number(ms) || 0);
+  if (n < 60000) return `${Math.round(n / 1000)}s`;
+  if (n < 3600000) return `${Math.floor(n / 60000)}m ${Math.round((n % 60000) / 1000)}s`;
+  if (n < 86400000) return `${Math.floor(n / 3600000)}h ${Math.floor((n % 3600000) / 60000)}m`;
+  return `${Math.floor(n / 86400000)}d ${Math.floor((n % 86400000) / 3600000)}h`;
+}
+
+export function pnlEmoji(pnl) {
+  const n = Number(pnl || 0);
+  if (n > 0) return '🟢';
+  if (n < 0) return '🔴';
+  return '⚪';
+}

@@ -10,9 +10,13 @@ export function openPositionCount() {
   return db.prepare('SELECT COUNT(*) AS count FROM dry_run_positions WHERE status = ?').get('open').count;
 }
 
-export function canOpenMorePositions() {
-  const strat = activeStrategy();
-  const max = strat.max_open_positions ?? numSetting('max_open_positions', 3);
+export function canOpenMorePositions(strat = null) {
+  let max;
+  if (strat && strat.max_open_positions != null) {
+    max = strat.max_open_positions;
+  } else {
+    max = numSetting('max_open_positions', 3);
+  }
   if (max <= 0) return true;
   return openPositionCount() < max;
 }
@@ -26,8 +30,8 @@ export function allPositions(limit = 10) {
   return db.prepare('SELECT * FROM dry_run_positions ORDER BY id DESC LIMIT ?').all(limit);
 }
 
-export function createDryRunPosition(candidateId, candidate, decision, reason = 'llm_buy') {
-  const strat = activeStrategy();
+export function createDryRunPosition(candidateId, candidate, decision, reason = 'llm_buy', strat = null) {
+  if (!strat) strat = activeStrategy();
   const sizeSol = strat.position_size_sol ?? numSetting('dry_run_buy_sol', 0.1);
   const entryPrice = Number(candidate.metrics.priceUsd || 0) || null;
   const entryMcap = Number(candidate.metrics.marketCapUsd || candidate.metrics.graduatedMarketCapUsd || 0) || null;

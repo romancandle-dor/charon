@@ -1,4 +1,4 @@
-import { escapeHtml, fmtPct, fmtSol, fmtUsd, short, gmgnLink, txLink, accountLink } from '../format.js';
+import { escapeHtml, fmtPct, fmtSol, fmtUsd, short, gmgnLink, txLink, accountLink, fmtDuration, pnlEmoji } from '../format.js';
 
 export function formatRecipients(shareholders) {
   if (!shareholders?.length) return '';
@@ -97,21 +97,29 @@ export function batchRevealSummary(batchId, rows, decision, triggerCandidateId =
 }
 
 export function formatPosition(position) {
+  const isOpen = position.status === 'open';
   const pnl = position.pnl_percent != null
     ? Number(position.pnl_percent)
     : position.entry_mcap && position.high_water_mcap
       ? (Number(position.high_water_mcap) / Number(position.entry_mcap) - 1) * 100
       : 0;
+  const age = position.opened_at_ms ? `${fmtDuration(Date.now() - position.opened_at_ms)}` : null;
+  const statusIcon = isOpen
+    ? pnl > 0 ? '🟢' : pnl < 0 ? '🔴' : '⚪'
+    : '🏁';
+  const modeIcon = position.execution_mode === 'live' ? '💧' : position.execution_mode === 'confirm' ? '🧾' : '🏜️';
   return [
-    `📍 <b>${escapeHtml(position.symbol || short(position.mint))}</b> #${position.id}`,
-    `Token: <a href="${gmgnLink(position.mint)}">${short(position.mint)}</a>`,
-    `Status: <b>${escapeHtml(position.status)}</b> · Mode: <b>${escapeHtml(position.execution_mode || 'dry_run')}</b> · Strategy: <b>${escapeHtml(position.strategy_id || 'sniper')}</b>`,
-    position.entry_signature ? `Entry TX: <a href="${txLink(position.entry_signature)}">${short(position.entry_signature)}</a>` : null,
-    `Entry mcap: ${fmtUsd(position.entry_mcap)} · High: ${fmtUsd(position.high_water_mcap)}`,
-    `Size: ${fmtSol(position.size_sol)} SOL · PnL: ${fmtPct(pnl)}`,
-    `TP: ${fmtPct(position.tp_percent)} · SL: ${fmtPct(position.sl_percent)} · Trail: ${position.trailing_enabled ? `${fmtPct(position.trailing_percent)}` : 'off'}`,
-    position.exit_reason ? `Exit: ${escapeHtml(position.exit_reason)} at ${fmtUsd(position.exit_mcap)} (${fmtPct(position.pnl_percent)})` : null,
-    position.exit_signature ? `Exit TX: <a href="${txLink(position.exit_signature)}">${short(position.exit_signature)}</a>` : null,
+    `${statusIcon} <b>${escapeHtml(position.symbol || short(position.mint))}</b> #${position.id} ${modeIcon}`,
+    `<a href="${gmgnLink(position.mint)}">${short(position.mint)}</a> · ${escapeHtml(position.strategy_id || 'sniper')}`,
+    isOpen
+      ? `Mcap: ${fmtUsd(position.entry_mcap)} → ${fmtUsd(position.high_water_mcap)} · Age: ${age}`
+      : `Exit: ${escapeHtml(position.exit_reason || 'closed')} at ${fmtUsd(position.exit_mcap)}`,
+    isOpen
+      ? `PnL: ${pnlEmoji(pnl)} <b>${fmtPct(pnl)}</b> · Size: ${fmtSol(position.size_sol)} SOL`
+      : `PnL: ${pnlEmoji(pnl)} <b>${fmtPct(position.pnl_percent)}</b> (${fmtSol(position.pnl_sol)} SOL) · Held: ${age}`,
+    `TP ${fmtPct(position.tp_percent)} · SL ${fmtPct(position.sl_percent)}${position.trailing_enabled ? ` · Trail ${fmtPct(position.trailing_percent)}` : ''}`,
+    position.entry_signature ? `Entry: <a href="${txLink(position.entry_signature)}">${short(position.entry_signature)}</a>` : null,
+    position.exit_signature ? `Exit: <a href="${txLink(position.exit_signature)}">${short(position.exit_signature)}</a>` : null,
   ].filter(Boolean).join('\n');
 }
 

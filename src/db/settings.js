@@ -53,6 +53,14 @@ export function allStrategies() {
   }));
 }
 
+export function allEnabledStrategies() {
+  return db.prepare('SELECT * FROM strategies WHERE enabled = 1 ORDER BY id').all().map(row => ({
+    id: row.id,
+    name: row.name,
+    ...JSON.parse(row.config_json),
+  }));
+}
+
 export function setActiveStrategy(id) {
   db.prepare('UPDATE strategies SET enabled = 0').run();
   db.prepare('UPDATE strategies SET enabled = 1 WHERE id = ?').run(id);

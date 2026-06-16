@@ -3,6 +3,7 @@ import { ENABLE_LLM, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_TIMEOUT_MS } from
 import { now, stripThinking, strictJsonFromText } from '../utils.js';
 import { numSetting } from '../db/settings.js';
 import { db } from '../db/connection.js';
+import { allSignalWeights } from '../db/weights.js';
 
 export function normalizeDecision(parsed, fallbackReason = '') {
   const verdict = ['BUY', 'WATCH', 'PASS'].includes(String(parsed?.verdict).toUpperCase())
@@ -20,13 +21,17 @@ export function normalizeDecision(parsed, fallbackReason = '') {
 }
 
 export function activeLessonsForPrompt(limit = 6) {
-  return db.prepare(`
-    SELECT lesson
+  const rows = db.prepare(`
+    SELECT lesson, category, priority
     FROM learning_lessons
     WHERE status = 'active'
-    ORDER BY id DESC
+    ORDER BY priority DESC, id DESC
     LIMIT ?
-  `).all(limit).map(row => row.lesson);
+  `).all(limit);
+  return rows.map(row => row.category !== 'general'
+    ? `[${row.category}] ${row.lesson}`
+    : row.lesson
+  );
 }
 
 export function compactCandidateForLlm(row) {
@@ -65,19 +70,79 @@ export function compactCandidateForLlm(row) {
   };
 }
 
-export async function decideCandidateBatch(rows, triggerCandidateId) {
-  if (!ENABLE_LLM || !LLM_API_KEY) {
+// Rule-based fallback picker used when LLM is disabled or LLM_API_KEY is missing.
+// Scores each candidate by on-chain + market signals and returns the strongest
+// eligible row as a BUY. Mirrors the LLM's expected return shape so downstream
+// code (orchestrator, position creation) works without changes.
+function ruleBasedPick(rows, triggerCandidateId) {
+  const weights = allSignalWeights();
+  const eligible = [];
+  const maxScore = 140;
+  for (const r of rows || []) {
+    if (!r) continue;
+    const c = r.candidate || {};
+    if (c.filters && c.filters.passed === false) continue;
+    const m = c.metrics || {};
+    const g = c.gmgn || {};
+    const gStat = g.stat || {};
+    const gPrice = g.price || {};
+    const tags = g.wallet_tags_stat || {};
+    const trending = c.trending || {};
+
+    const num = (v) => Number(v) || 0;
+    const w = (sig) => weights[sig] ?? 1.0;
+    let score = 0;
+    score += (num(gStat.top_bundler_trader_percentage) < 0.5 ? 20 * w('top_bundler_trader_percentage') : -10 * w('top_bundler_trader_percentage_penalty'));
+    score += (num(gStat.top_rat_trader_percentage) < 0.3 ? 20 * w('top_rat_trader_percentage') : -10 * w('top_rat_trader_percentage_penalty'));
+    score += (num(gStat.top_10_holder_rate) < 0.4 ? 10 * w('top_10_holder_rate') : 0);
+    score += ((num(m.holderCount) || num(g.holder_count)) >= 200 ? 20 * w('holder_200') : 0);
+    score += ((num(m.liquidityUsd) || num(g.liquidity)) >= 5000 ? 20 * w('liquidity_5000') : 0);
+    score += (num(gPrice.volume_24h) >= 20000 ? 20 * w('volume_24h_20000') : 0);
+    score += ((num(trending.rank) || 999) <= 50 ? 10 * w('trending_rank_50') : 0);
+    score += (num(trending.organicScore) >= 50 ? 10 * w('organic_score_50') : 0);
+    score += (num(tags.smart_wallets) >= 15 ? 5 * w('smart_wallets_15') : 0);
+    score += (num(m.gmgnTotalFeesSol) >= 2 ? 5 * w('gmgn_fees_2') : 0);
+
+    eligible.push({ row: r, score, mint: c.token?.mint || r.mint });
+  }
+
+  eligible.sort((a, b) => b.score - a.score);
+  const top = eligible[0];
+  const tp = numSetting('default_tp_percent', 50);
+  const sl = numSetting('default_sl_percent', -25);
+
+  if (!top || top.score < 30) {
     return {
       verdict: 'WATCH',
       confidence: 0,
       selected_candidate_id: null,
       selected_mint: null,
-      reason: 'LLM disabled or LLM_API_KEY missing.',
-      risks: ['no_llm_decision'],
-      suggested_tp_percent: numSetting('default_tp_percent', 50),
-      suggested_sl_percent: numSetting('default_sl_percent', -25),
+      reason: `Rule-based: no candidate cleared threshold (top score ${top?.score ?? 0}).`,
+      risks: ['rule_based_no_pick'],
+      suggested_tp_percent: tp,
+      suggested_sl_percent: sl,
       raw: null,
     };
+  }
+
+  const candId = top.row.id ?? triggerCandidateId ?? null;
+  return {
+    verdict: 'BUY',
+    confidence: Math.min(100, Math.round(top.score / maxScore * 100)),
+    selected_candidate_id: candId,
+    selected_mint: top.mint,
+    selected_row: top.row,
+    reason: `Rule-based pick: score ${top.score.toFixed(0)}/${maxScore} (adjusted by learned weights).`,
+    risks: ['rule_based_no_llm_review'],
+    suggested_tp_percent: tp,
+    suggested_sl_percent: sl,
+    raw: null,
+  };
+}
+
+export async function decideCandidateBatch(rows, triggerCandidateId) {
+  if (!ENABLE_LLM || !LLM_API_KEY) {
+    return ruleBasedPick(rows, triggerCandidateId);
   }
 
   const system = [
